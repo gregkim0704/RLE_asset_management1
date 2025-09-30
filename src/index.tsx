@@ -2,9 +2,45 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { SimpleEnhancedAPI } from './services/simple-enhanced-api'
+import { 
+  RealTradingManager, 
+  KiwoomTradingService, 
+  NHTradingService, 
+  createBrokerConfigs 
+} from './services/real-trading-api'
+import { 
+  AITradingEngine, 
+  createDefaultTradingConfig 
+} from './services/ai-trading-engine'
+import { 
+  RiskManagementSystem, 
+  EmergencyResponseSystem 
+} from './services/risk-management'
 
 const app = new Hono()
 const enhancedAPI = new SimpleEnhancedAPI()
+
+// 실거래 시스템 초기화
+const brokerConfigs = createBrokerConfigs()
+const tradingManager = new RealTradingManager()
+const tradingConfig = createDefaultTradingConfig()
+const riskSystem = new RiskManagementSystem(tradingConfig)
+const emergencySystem = new EmergencyResponseSystem(riskSystem)
+
+// 증권사 서비스 등록
+if (brokerConfigs.kiwoom.apiKey) {
+  const kiwoomService = new KiwoomTradingService(brokerConfigs.kiwoom)
+  tradingManager.registerBroker('kiwoom', kiwoomService)
+  tradingManager.setPrimaryBroker('kiwoom')
+}
+
+if (brokerConfigs.nh.apiKey) {
+  const nhService = new NHTradingService(brokerConfigs.nh)
+  tradingManager.registerBroker('nh', nhService)
+}
+
+// AI 자동매매 엔진 초기화
+const aiTradingEngine = new AITradingEngine(tradingManager, enhancedAPI, tradingConfig)
 
 // Enable CORS for API routes
 app.use('/api/*', cors())
@@ -274,6 +310,289 @@ app.get('/api/optimization/tax', async (c) => {
   }
 })
 
+// ========================
+// 🚀 REAL TRADING API ENDPOINTS
+// ========================
+
+// 실거래 계좌 정보 조회
+app.get('/api/trading/account', async (c) => {
+  try {
+    const balance = await tradingManager.getAccountBalance()
+    
+    return c.json({
+      success: true,
+      data: {
+        totalAssets: balance.totalAssets,
+        cashBalance: balance.cashBalance,
+        stockValue: balance.stockValue,
+        purchaseAmount: balance.purchaseAmount,
+        evaluationPL: balance.evaluationPL,
+        positions: balance.positions.map(pos => ({
+          symbol: pos.symbol,
+          symbolName: pos.symbolName,
+          quantity: pos.quantity,
+          avgPrice: pos.avgPrice,
+          currentPrice: pos.currentPrice,
+          evaluationAmount: pos.evaluationAmount,
+          profitLoss: pos.profitLoss,
+          profitLossRate: pos.profitLossRate
+        }))
+      }
+    })
+  } catch (error) {
+    console.error('Account API error:', error)
+    return c.json({ 
+      success: false, 
+      error: '계좌 정보를 가져올 수 없습니다. API 키를 확인해주세요.' 
+    }, 500)
+  }
+})
+
+// 실시간 주가 조회
+app.get('/api/trading/price/:symbol', async (c) => {
+  const symbol = c.req.param('symbol')
+  
+  try {
+    const price = await tradingManager.getRealTimePrice(symbol)
+    
+    return c.json({
+      success: true,
+      data: price
+    })
+  } catch (error) {
+    console.error(`Price API error for ${symbol}:`, error)
+    return c.json({ 
+      success: false, 
+      error: `${symbol} 종목의 실시간 시세를 가져올 수 없습니다.` 
+    }, 500)
+  }
+})
+
+// 주식 주문 실행
+app.post('/api/trading/order', async (c) => {
+  try {
+    const orderData = await c.req.json()
+    
+    // 주문 데이터 검증
+    const requiredFields = ['symbol', 'orderType', 'orderMethod', 'quantity', 'accountNo']
+    for (const field of requiredFields) {
+      if (!orderData[field]) {
+        return c.json({
+          success: false,
+          error: `필수 필드가 누락되었습니다: ${field}`
+        }, 400)
+      }
+    }
+    
+    // 주문 실행
+    const orderResult = await tradingManager.placeOrder({
+      symbol: orderData.symbol,
+      orderType: orderData.orderType,
+      orderMethod: orderData.orderMethod,
+      quantity: orderData.quantity,
+      price: orderData.price,
+      accountNo: orderData.accountNo
+    })
+    
+    return c.json({
+      success: true,
+      data: orderResult
+    })
+  } catch (error) {
+    console.error('Order API error:', error)
+    return c.json({ 
+      success: false, 
+      error: error instanceof Error ? error.message : '주문 실행에 실패했습니다.' 
+    }, 500)
+  }
+})
+
+// 리스크 메트릭 조회
+app.get('/api/trading/risk-metrics', async (c) => {
+  try {
+    const balance = await tradingManager.getAccountBalance()
+    
+    // 실시간 가격 정보 수집
+    const marketPrices = new Map()
+    for (const position of balance.positions) {
+      try {
+        const price = await tradingManager.getRealTimePrice(position.symbol)
+        marketPrices.set(position.symbol, price)
+      } catch (error) {
+        console.error(`Failed to get price for ${position.symbol}:`, error)
+      }
+    }
+    
+    // 리스크 메트릭 계산
+    const riskMetrics = await riskSystem.calculateRiskMetrics(balance, marketPrices)
+    const alerts = riskSystem.generateRiskAlerts(riskMetrics)
+    const breakers = riskSystem.checkCircuitBreakers(riskMetrics)
+    
+    // 긴급 상황 체크
+    await emergencySystem.handleEmergency(breakers, balance, tradingManager)
+    
+    return c.json({
+      success: true,
+      data: {
+        metrics: {
+          var95: riskMetrics.portfolioVar.var95,
+          var99: riskMetrics.portfolioVar.var99,
+          expectedShortfall: riskMetrics.portfolioVar.expectedShortfall,
+          leverage: riskMetrics.leverage,
+          maxSinglePosition: riskMetrics.concentration.maxSinglePosition,
+          liquidityRatio: riskMetrics.liquidity.liquidityRatio,
+          avgCorrelation: riskMetrics.correlation.avgCorrelation,
+          currentDrawdown: riskMetrics.drawdown.currentDrawdown,
+          maxDrawdown: riskMetrics.drawdown.maxDrawdown
+        },
+        alerts: alerts,
+        circuitBreakers: breakers.map(b => ({
+          name: b.name,
+          triggered: b.triggered,
+          threshold: b.threshold,
+          currentValue: b.currentValue,
+          action: b.action
+        }))
+      }
+    })
+  } catch (error) {
+    console.error('Risk metrics API error:', error)
+    return c.json({ 
+      success: false, 
+      error: '리스크 메트릭을 계산할 수 없습니다.' 
+    }, 500)
+  }
+})
+
+// AI 자동매매 시작/중지
+app.post('/api/trading/auto-trading/:action', async (c) => {
+  const action = c.req.param('action')
+  
+  try {
+    if (action === 'start') {
+      await aiTradingEngine.start()
+      return c.json({
+        success: true,
+        message: 'AI 자동매매가 시작되었습니다.'
+      })
+    } else if (action === 'stop') {
+      aiTradingEngine.stop()
+      return c.json({
+        success: true,
+        message: 'AI 자동매매가 중지되었습니다.'
+      })
+    } else {
+      return c.json({
+        success: false,
+        error: '잘못된 액션입니다. start 또는 stop을 사용하세요.'
+      }, 400)
+    }
+  } catch (error) {
+    console.error('Auto trading API error:', error)
+    return c.json({ 
+      success: false, 
+      error: error instanceof Error ? error.message : '자동매매 제어에 실패했습니다.' 
+    }, 500)
+  }
+})
+
+// 포트폴리오 리밸런싱 실행
+app.post('/api/trading/rebalance', async (c) => {
+  try {
+    const results = await aiTradingEngine.executeRebalancing()
+    
+    return c.json({
+      success: true,
+      data: {
+        tradesExecuted: results.filter(r => r.executed).length,
+        totalTrades: results.length,
+        results: results.map(r => ({
+          symbol: r.decision.symbol,
+          action: r.decision.action,
+          executed: r.executed,
+          confidence: r.decision.confidence,
+          reasoning: r.decision.reasoning,
+          orderId: r.order?.orderId,
+          errorMessage: r.errorMessage
+        }))
+      }
+    })
+  } catch (error) {
+    console.error('Rebalancing API error:', error)
+    return c.json({ 
+      success: false, 
+      error: error instanceof Error ? error.message : '리밸런싱 실행에 실패했습니다.' 
+    }, 500)
+  }
+})
+
+// 자동매매 성과 조회
+app.get('/api/trading/performance', async (c) => {
+  try {
+    const performance = aiTradingEngine.getPerformanceMetrics()
+    
+    return c.json({
+      success: true,
+      data: {
+        totalTrades: performance.totalTrades,
+        winTrades: performance.winTrades,
+        winRate: performance.winRate,
+        totalPnL: performance.totalPnL,
+        avgPnLPerTrade: performance.avgPnLPerTrade,
+        maxDrawdown: performance.maxDrawdown
+      }
+    })
+  } catch (error) {
+    console.error('Performance API error:', error)
+    return c.json({ 
+      success: false, 
+      error: '성과 데이터를 가져올 수 없습니다.' 
+    }, 500)
+  }
+})
+
+// 자동매매 설정 업데이트
+app.put('/api/trading/config', async (c) => {
+  try {
+    const newConfig = await c.req.json()
+    
+    aiTradingEngine.updateConfiguration(newConfig)
+    
+    return c.json({
+      success: true,
+      message: '자동매매 설정이 업데이트되었습니다.'
+    })
+  } catch (error) {
+    console.error('Config update API error:', error)
+    return c.json({ 
+      success: false, 
+      error: '설정 업데이트에 실패했습니다.' 
+    }, 500)
+  }
+})
+
+// 증권사 API 연결 상태 확인
+app.get('/api/trading/broker-status', async (c) => {
+  try {
+    const authResults = await tradingManager.authenticateAll()
+    
+    return c.json({
+      success: true,
+      data: {
+        kiwoom: authResults[0] || false,
+        nh: authResults[1] || false,
+        primaryBroker: 'kiwoom' // tradingManager에서 가져와야 하지만 단순화
+      }
+    })
+  } catch (error) {
+    console.error('Broker status API error:', error)
+    return c.json({ 
+      success: false, 
+      error: '증권사 연결 상태를 확인할 수 없습니다.' 
+    }, 500)
+  }
+})
+
 app.get('/api/insurance/portfolio', async (c) => {
   try {
     // Get risk metrics for insurance optimization context
@@ -436,17 +755,20 @@ app.get('/', (c) => {
             <!-- 탭 메뉴 -->
             <div class="bg-white rounded-lg shadow-sm border mb-8">
                 <div class="border-b border-gray-200">
-                    <nav class="-mb-px flex space-x-8 px-6">
-                        <button class="tab-btn border-b-2 border-blue-500 py-4 px-1 text-blue-600 font-medium" data-tab="portfolio">
+                    <nav class="-mb-px flex space-x-8 px-6 overflow-x-auto">
+                        <button class="tab-btn border-b-2 border-blue-500 py-4 px-1 text-blue-600 font-medium whitespace-nowrap" data-tab="portfolio">
                             <i class="fas fa-chart-pie mr-2"></i>포트폴리오
                         </button>
-                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700" data-tab="backtest">
+                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700 whitespace-nowrap" data-tab="real-trading">
+                            <i class="fas fa-exchange-alt mr-2"></i>실거래 관리
+                        </button>
+                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700 whitespace-nowrap" data-tab="backtest">
                             <i class="fas fa-history mr-2"></i>백테스트
                         </button>
-                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700" data-tab="tax">
+                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700 whitespace-nowrap" data-tab="tax">
                             <i class="fas fa-calculator mr-2"></i>세무 최적화
                         </button>
-                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700" data-tab="insurance">
+                        <button class="tab-btn border-b-2 border-transparent py-4 px-1 text-gray-500 hover:text-gray-700 whitespace-nowrap" data-tab="insurance">
                             <i class="fas fa-shield-alt mr-2"></i>보험 포트폴리오
                         </button>
                     </nav>
@@ -497,6 +819,155 @@ app.get('/', (c) => {
                             <h3 class="text-lg font-medium text-gray-900 mb-4">백테스트 결과</h3>
                             <div id="backtestResults" class="bg-gray-50 p-6 rounded-lg">
                                 <p class="text-gray-500 text-center">백테스트를 실행해주세요</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 실거래 관리 탭 -->
+                <div id="real-trading-tab" class="tab-content p-6 hidden">
+                    <div class="space-y-6">
+                        <!-- 실거래 상태 개요 -->
+                        <div class="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-6">
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <h3 class="text-lg font-medium text-blue-900">실거래 시스템 상태</h3>
+                                    <p class="text-sm text-blue-700 mt-1">AI 자동매매 및 리스크 관리 시스템</p>
+                                </div>
+                                <div class="flex space-x-3">
+                                    <button onclick="showAutoTradingControls()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                                        <i class="fas fa-cog mr-2"></i>제어 패널
+                                    </button>
+                                    <button onclick="executeRebalancing()" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors">
+                                        <i class="fas fa-balance-scale mr-2"></i>리밸런싱
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 실시간 계좌 현황 -->
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <div class="lg:col-span-2">
+                                <div class="bg-white rounded-lg border shadow-sm">
+                                    <div class="p-6 border-b border-gray-200">
+                                        <div class="flex items-center justify-between">
+                                            <h3 class="text-lg font-medium text-gray-900">실시간 포지션</h3>
+                                            <div class="flex items-center space-x-2 text-sm text-gray-500">
+                                                <i class="fas fa-sync-alt animate-spin text-blue-500"></i>
+                                                <span>실시간 연동</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="p-6">
+                                        <div id="realPositionsList" class="space-y-3">
+                                            <div class="text-center py-8 text-gray-500">
+                                                <i class="fas fa-chart-line text-3xl mb-2"></i>
+                                                <p>실거래 계좌 연결 후 포지션이 표시됩니다</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="space-y-6">
+                                <!-- AI 추천 거래 -->
+                                <div class="bg-white rounded-lg border shadow-sm">
+                                    <div class="p-4 border-b border-gray-200">
+                                        <h4 class="font-medium text-gray-900">
+                                            <i class="fas fa-robot text-purple-600 mr-2"></i>AI 추천
+                                        </h4>
+                                    </div>
+                                    <div class="p-4">
+                                        <div id="aiRecommendations" class="space-y-3">
+                                            <div class="text-center py-6 text-gray-500">
+                                                <i class="fas fa-brain text-2xl mb-2"></i>
+                                                <p class="text-sm">AI 분석 중...</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 리스크 모니터링 -->
+                                <div class="bg-white rounded-lg border shadow-sm">
+                                    <div class="p-4 border-b border-gray-200">
+                                        <h4 class="font-medium text-gray-900">
+                                            <i class="fas fa-shield-alt text-red-600 mr-2"></i>리스크 모니터
+                                        </h4>
+                                    </div>
+                                    <div class="p-4">
+                                        <div id="riskMonitor" class="space-y-3">
+                                            <div class="flex justify-between items-center">
+                                                <span class="text-sm text-gray-600">VaR (95%)</span>
+                                                <span class="font-medium text-red-600" id="currentVaR">-</span>
+                                            </div>
+                                            <div class="flex justify-between items-center">
+                                                <span class="text-sm text-gray-600">포트폴리오 베타</span>
+                                                <span class="font-medium" id="currentBeta">-</span>
+                                            </div>
+                                            <div class="flex justify-between items-center">
+                                                <span class="text-sm text-gray-600">현재 낙폭</span>
+                                                <span class="font-medium" id="currentDrawdown">-</span>
+                                            </div>
+                                            <div class="mt-3 pt-3 border-t border-gray-200">
+                                                <div class="flex items-center space-x-2">
+                                                    <div class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                                                    <span class="text-xs text-gray-600">실시간 모니터링</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 최근 거래 내역 -->
+                        <div class="bg-white rounded-lg border shadow-sm">
+                            <div class="p-6 border-b border-gray-200">
+                                <h3 class="text-lg font-medium text-gray-900">최근 거래 내역</h3>
+                            </div>
+                            <div class="p-6">
+                                <div id="recentTrades" class="overflow-x-auto">
+                                    <table class="min-w-full divide-y divide-gray-200">
+                                        <thead class="bg-gray-50">
+                                            <tr>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">시간</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">종목</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">구분</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">수량</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">가격</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">상태</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tradesTableBody" class="bg-white divide-y divide-gray-200">
+                                            <tr>
+                                                <td colspan="6" class="px-6 py-8 text-center text-gray-500">
+                                                    <i class="fas fa-exchange-alt text-2xl mb-2"></i>
+                                                    <p>거래 내역이 없습니다</p>
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 자동매매 성과 -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div class="bg-white p-4 rounded-lg border shadow-sm text-center">
+                                <div class="text-2xl font-bold text-blue-600" id="totalTrades">-</div>
+                                <div class="text-sm text-gray-600">총 거래 수</div>
+                            </div>
+                            <div class="bg-white p-4 rounded-lg border shadow-sm text-center">
+                                <div class="text-2xl font-bold text-green-600" id="winRate">-</div>
+                                <div class="text-sm text-gray-600">승률</div>
+                            </div>
+                            <div class="bg-white p-4 rounded-lg border shadow-sm text-center">
+                                <div class="text-2xl font-bold text-purple-600" id="totalPnL">-</div>
+                                <div class="text-sm text-gray-600">총 손익</div>
+                            </div>
+                            <div class="bg-white p-4 rounded-lg border shadow-sm text-center">
+                                <div class="text-2xl font-bold text-orange-600" id="avgTradeReturn">-</div>
+                                <div class="text-sm text-gray-600">평균 수익률</div>
                             </div>
                         </div>
                     </div>
